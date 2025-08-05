@@ -1,3 +1,5 @@
+from datetime import datetime
+
 import torch
 import cv2
 import numpy as np
@@ -9,6 +11,8 @@ from ultralytics.nn.tasks import  attempt_load_weights
 from plate_recognition.plate_rec import get_plate_result,init_model,cv_imread
 from plate_recognition.double_plate_split_merge import get_split_merge
 from fonts.cv_puttext import cv2ImgAddText
+import pandas as pd
+import glob
 
 def allFilePath(rootPath,allFIleList):# 读取文件夹内的文件，放到list
     fileList = os.listdir(rootPath)
@@ -138,6 +142,9 @@ def det_rec_plate(img,img_ori,detect_model,plate_rec_model):
         rect = [int(x) for x in rect]
         label = output[-1]
         roi_img = img_ori[rect[1]:rect[3],rect[0]:rect[2]]
+        if roi_img is None or roi_img.size == 0:
+            # print(f"Warning: empty roi_img at rect {rect}")
+            continue
         # land_marks=np.array(output[5:13],dtype='int64').reshape(4,2)
         # roi_img = four_point_transform(img_ori,land_marks)   #透视变换得到车牌小图
         if int(label):        #判断是否是双层车牌，是双牌的话进行分割后然后拼接
@@ -197,51 +204,151 @@ def draw_result(orgimg,dict_list,is_color=False):   # 车牌结果画出来
     return orgimg
 
 
+def process_video(video_path, detect_model, plate_rec_model, device, save_path, fps=None):
+    """
+    处理单个视频文件或摄像头流，执行车牌检测并保存结果到Excel
+    :param video_path: 视频文件路径或摄像头索引（字符串）
+    :param detect_model: YOLOv8 检测模型
+    :param plate_rec_model: 车牌识别模型
+    :param device: 计算设备 (cpu/cuda)
+    :param save_path: 结果保存路径
+    :param fps: 可选帧率，若为None则从视频中获取
+    """
+    # 判断是摄像头还是视频文件
+    if video_path.isdigit():
+        cap = cv2.VideoCapture(int(video_path))
+    else:
+        cap = cv2.VideoCapture(video_path)
+
+    if not cap.isOpened():
+        print(f"无法打开视频源: {video_path}")
+        return
+
+    frame_id = 0
+    results = []
+
+    # 获取视频帧率（每秒多少帧）
+    if fps is None:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        print("警告：无法获取有效帧率，设为默认 30 FPS")
+        fps = 30.0
+    print(f"视频帧率: {fps:.2f} FPS")
+    # 计算每秒跳过的帧数（即：处理一帧后，跳过 fps 帧）
+    frames_per_second = int(round(fps / 2))  # 每0.5秒处理1帧
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        img_ori = copy.deepcopy(frame)
+        result_list = det_rec_plate(frame, img_ori, detect_model, plate_rec_model)
+        # 获取当前帧的时间（秒）
+        now_time = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+
+        for r in result_list:
+            print(now_time, "  ", r)
+            # 增加函数判断，如果车牌位置超过4096*1650/2560=2640 说明是对向车道车辆，跳过数据
+            rect = r['rect']
+            if rect[0] > 2640:  # 过滤对向车道
+                continue
+            results.append({
+                'frame': frame_id,
+                'time': now_time,
+                'plate_no': r['plate_no'],
+                'plate_color': r['plate_color']
+            })
+
+        # 跳过接下来的 1 秒（即 skip frames_per_second 帧）
+        # 跳过接下来的 ~0.5 秒的帧
+        for _ in range(frames_per_second):
+            ret = cap.read()[0]
+            if not ret:
+                break  # 视频结束
+
+        # 更新 frame_id（注意：我们只对处理的帧计数）
+        frame_id += frames_per_second + 1  # 当前帧 + 跳过的帧数
+
+        # 可选：实时显示处理的帧
+        # cv2.imshow('Processed Frame', draw_result(frame, result_list))
+        # if cv2.waitKey(1) & 0xFF == ord('q'):
+        #     break
+
+    cap.release()
+    # cv2.destroyAllWindows()  # 如果启用显示才需要
+
+    # 保存结果
+    video_name = os.path.splitext(os.path.basename(str(video_path)))[0] if not video_path.isdigit() else "camera"
+    excel_path = os.path.join(save_path, f'{video_name}_result.xlsx')
+    df = pd.DataFrame(results)
+    df.to_excel(excel_path, index=False)
+    print(f"结果已保存至: {excel_path}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--detect_model', nargs='+', type=str, default=r'weights/yolov8s.pt', help='model.pt path(s)')  #yolov8检测模型
-    parser.add_argument('--rec_model', type=str, default=r'weights/plate_rec_color.pth', help='model.pt path(s)')#车牌字符识别模型  
-    parser.add_argument('--image_path', type=str, default=r'imgs', help='source')   #待识别图片路径
-    parser.add_argument('--img_size', type=int, default=640, help='inference size (pixels)')  #yolov8 网络模型输入大小
-    parser.add_argument('--output', type=str, default='result', help='source')     #结果保存的文件夹
-    device =torch.device("cuda" if torch.cuda.is_available() else "cpu")  
+    parser.add_argument('--detect_model', nargs='+', type=str, default=r'weights/yolov8s.pt', help='model.pt path(s)')
+    parser.add_argument('--rec_model', type=str, default=r'weights/plate_rec_color.pth', help='model.pt path(s)')
+    parser.add_argument('--image_path', type=str, default=r'imgs', help='source')
+    parser.add_argument('--video_path', type=str, default=r'E:\xx过车数据\8月1日(视频)\xxx下午4点-6点主线桥西向东车流\D2_20250801160000_20250801161101.mp4', help='video file or camera index, e.g. 0')
+    parser.add_argument('--img_size', type=int, default=640, help='inference size (pixels)')
+    parser.add_argument('--output', type=str, default='result', help='source')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     clors = [(255,0,0),(0,255,0),(0,0,255),(255,255,0),(0,255,255)]
     opt = parser.parse_args()
-    save_path = opt.output                
+    save_path = opt.output
 
-    if not os.path.exists(save_path): 
+    if not os.path.exists(save_path):
         os.mkdir(save_path)
-        
-    detect_model = load_model(opt.detect_model, device)  #初始化yolov8识别模型
-    plate_rec_model=init_model(device,opt.rec_model,is_color=True)      #初始化识别模型
-    #算参数量
+
+    detect_model = load_model(opt.detect_model, device)
+    plate_rec_model = init_model(device, opt.rec_model, is_color=True)
+
+    # 打印参数量
     total = sum(p.numel() for p in detect_model.parameters())
     total_1 = sum(p.numel() for p in plate_rec_model.parameters())
-    print("yolov8 detect params: %.2fM,rec params: %.2fM" % (total/1e6,total_1/1e6))
-    
-    detect_model.eval() 
-    # print(detect_model)
-    file_list = []
-    allFilePath(opt.image_path,file_list)
-    count=0
-    time_all = 0
-    time_begin=time.time()
-    for pic_ in file_list:
-        print(count,pic_,end=" ")
-        time_b = time.time()               #开始时间
-        img = cv2.imread(pic_)
-        img_ori = copy.deepcopy(img)
-        result_list=det_rec_plate(img,img_ori,detect_model,plate_rec_model)
-        time_e=time.time()
-        ori_img=draw_result(img,result_list)  #将结果画在图上
-        img_name = os.path.basename(pic_)  
-        save_img_path = os.path.join(save_path,img_name)  #图片保存的路径
-        time_gap = time_e-time_b                         #计算单个图片识别耗时
-        if count:
-            time_all+=time_gap 
-        count+=1
-        cv2.imwrite(save_img_path,ori_img)               #op
-        # print(result_list)
-    print(f"sumTime time is {time.time()-time_begin} s, average pic time is {time_all/(len(file_list)-1)}")
-     
+    print("yolov8 detect params: %.2fM, rec params: %.2fM" % (total/1e6, total_1/1e6))
+
+    detect_model.eval()
+
+    # ========== 视频处理逻辑 ==========
+    if opt.video_path:
+        video_path = opt.video_path
+        if os.path.isdir(video_path):
+            # 处理文件夹中所有视频
+            video_files = glob.glob(os.path.join(video_path, '*.mp4')) + \
+                          glob.glob(os.path.join(video_path, '*.avi')) + \
+                          glob.glob(os.path.join(video_path, '*.mov'))
+            for vf in video_files:
+                print(f"正在处理视频: {vf}")
+                process_video(vf, detect_model, plate_rec_model, device, save_path)
+        else:
+            # 处理单个视频或摄像头
+            print(f"正在处理视频源: {video_path}")
+            process_video(video_path, detect_model, plate_rec_model, device, save_path)
+
+    # ========== 图片处理逻辑 ==========
+    else:
+        file_list = []
+        allFilePath(opt.image_path, file_list)
+        results = []
+        for pic_ in file_list:
+            img = cv2.imread(pic_)
+            if img is None:
+                continue
+            img_ori = copy.deepcopy(img)
+            result_list = det_rec_plate(img, img_ori, detect_model, plate_rec_model)
+            for r in result_list:
+                results.append({
+                    'image': pic_,
+                    'plate_no': r['plate_no'],
+                    'plate_color': r['plate_color']
+                })
+
+        output_filename = f'result_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
+        excel_path = os.path.join(save_path, output_filename)
+        df = pd.DataFrame(results)
+        df.to_excel(excel_path, index=False)
+        print(f"图片识别结果已保存至: {excel_path}")
